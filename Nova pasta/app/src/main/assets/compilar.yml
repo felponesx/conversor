@@ -1,0 +1,141 @@
+name: Compilar APK
+run-name: build ${{ inputs.id }}
+on:
+  workflow_dispatch:
+    inputs:
+      id: {required: true}
+      tipo: {required: true}
+      arquivo: {required: true}
+      nome: {required: false, default: "Meu App"}
+      pacote: {required: false, default: "com.meuapp.app"}
+      icone: {required: false, default: ""}
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: '21'}
+      - uses: actions/setup-node@v4
+        with: {node-version: '20'}
+      - if: inputs.tipo == 'flutter'
+        uses: subosito/flutter-action@v2
+        with: {channel: stable}
+      - if: inputs.tipo == 'kotlin'
+        uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: '8.7'}
+      - name: Compilar
+        env:
+          TIPO: ${{ inputs.tipo }}
+          ARQ: ${{ inputs.arquivo }}
+          NOME: ${{ inputs.nome }}
+          PACOTE: ${{ inputs.pacote }}
+          ICONE: ${{ inputs.icone }}
+        run: |
+          set -e
+          SAIDA="$GITHUB_WORKSPACE/saida"; mkdir -p "$SAIDA" /tmp/src
+          case "$ARQ" in
+            *.zip) unzip -q "$ARQ" -d /tmp/src ;;
+            *) cp "$ARQ" /tmp/src/index.html ;;
+          esac
+          achar() {
+            f=$(find /tmp/src -name "$1" -not -path '*/node_modules/*' -not -path '*/build/*' | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+            if [ -z "$f" ]; then echo "::error::Nao encontrei $1 no projeto. Confira se escolheu o tipo certo."; exit 1; fi
+            dirname "$f"
+          }
+          if [ -n "$ICONE" ] && ! command -v convert >/dev/null && ! command -v magick >/dev/null; then
+            sudo apt-get install -y imagemagick >/dev/null
+          fi
+          cat > /tmp/personalizar.py <<'PYEOF'
+          import os, re, glob, shutil, subprocess, sys
+          root = sys.argv[1]
+          nome = os.environ.get("NOME", "").strip()
+          icone = os.environ.get("ICONE", "").strip()
+          ws = os.environ.get("GITHUB_WORKSPACE", "")
+          if icone and not os.path.isabs(icone):
+              icone = os.path.join(ws, icone)
+
+          def ignorar(p):
+              return "/build/" in p or "/node_modules/" in p or "/.gradle/" in p
+
+          if nome:
+              esc = nome.replace("\\", "").replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;").replace("\n", " ")
+              for mf in glob.glob(root + "/**/AndroidManifest.xml", recursive=True):
+                  if ignorar(mf):
+                      continue
+                  s = open(mf, encoding="utf-8").read()
+                  def troca(m):
+                      tag = m.group(0)
+                      if re.search(r'android:label="[^"]*"', tag):
+                          return re.sub(r'android:label="[^"]*"', lambda _: 'android:label="' + esc + '"', tag, count=1)
+                      return tag.replace("<application", '<application android:label="' + esc + '"', 1)
+                  s2 = re.sub(r"<application\b[^>]*>", troca, s, count=1)
+                  if s2 != s:
+                      open(mf, "w", encoding="utf-8").write(s2)
+                      print("nome aplicado em", mf)
+
+          if icone and os.path.exists(icone):
+              magick = shutil.which("magick")
+              total = 0
+              for d in glob.glob(root + "/**/res/mipmap-*", recursive=True):
+                  if "anydpi" in d or ignorar(d + "/"):
+                      continue
+                  for f in glob.glob(d + "/ic_launcher*"):
+                      if not f.lower().endswith((".png", ".webp")):
+                          continue
+                      if "background" in os.path.basename(f):
+                          continue
+                      try:
+                          ident = ([magick, "identify"] if magick else ["identify"]) + ["-format", "%w", f + "[0]"]
+                          w = int(subprocess.check_output(ident).decode().strip())
+                          conv = ([magick] if magick else ["convert"]) + [icone, "-resize", "%dx%d!" % (w, w), f]
+                          subprocess.run(conv, check=True)
+                          total += 1
+                      except Exception as e:
+                          print("aviso: nao troquei", f, e)
+              print("icones trocados:", total)
+          elif icone:
+              print("aviso: icone nao encontrado:", icone)
+          PYEOF
+          personalizar() { python3 /tmp/personalizar.py "$1" || echo "aviso: a personalizacao falhou, seguindo sem ela"; }
+          case "$TIPO" in
+            html)
+              W=$(achar index.html)
+              mkdir -p /tmp/app && cd /tmp/app
+              npm init -y >/dev/null
+              npm i @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+              mkdir www && cp -r "$W"/. www/
+              npx cap init "$NOME" "$PACOTE" --web-dir www
+              npx cap add android
+              personalizar /tmp/app/android
+              cd android && chmod +x gradlew && ./gradlew assembleDebug
+              cp app/build/outputs/apk/debug/app-debug.apk "$SAIDA/app.apk" ;;
+            kotlin)
+              P=$(achar 'settings.gradle*'); cd "$P"
+              personalizar "$P"
+              if [ -f gradlew ]; then chmod +x gradlew; ./gradlew assembleDebug; else gradle assembleDebug; fi
+              A=$(find . -path '*outputs/apk/*' -name '*.apk' | head -1)
+              cp "$A" "$SAIDA/app.apk" ;;
+            flutter)
+              P=$(achar pubspec.yaml); cd "$P"
+              [ -d android ] || flutter create --platforms=android .
+              personalizar "$P"
+              flutter pub get
+              flutter build apk --release
+              cp build/app/outputs/flutter-apk/app-release.apk "$SAIDA/app.apk" ;;
+            reactnative)
+              P=$(achar package.json); cd "$P"
+              npm install
+              [ -d android ] || npx expo prebuild --platform android --no-install
+              personalizar "$P"
+              cd android && chmod +x gradlew && ./gradlew assembleRelease
+              cp app/build/outputs/apk/release/app-release.apk "$SAIDA/app.apk" ;;
+            *) echo "::error::Tipo desconhecido: $TIPO"; exit 1 ;;
+          esac
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ inputs.id }}
+          name: ${{ inputs.nome }} (${{ inputs.tipo }})
+          files: saida/app.apk
