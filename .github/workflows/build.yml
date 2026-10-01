@@ -1,0 +1,39 @@
+name: Compilar Conversor Nuvem
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Abrir o zip do projeto
+        run: |
+          mkdir projeto
+          unzip -q conversor-nuvem-kotlin-git.zip -d projeto
+          rm -rf projeto/.github
+          ls projeto
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Compilar
+        working-directory: projeto
+        run: gradle assembleDebug --no-daemon
+      - run: cp projeto/app/build/outputs/apk/debug/app-debug.apk conversor-nuvem.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conversor-nuvem-apk
+          path: conversor-nuvem.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v3-${{ github.run_number }}
+          name: Conversor Nuvem 3.0 (build ${{ github.run_number }})
+          files: conversor-nuvem.apk
